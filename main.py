@@ -16,7 +16,7 @@ import aiofiles
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from PIL import Image
 
 APP_NAME = os.getenv("APP_NAME", "MikuMiku Image Host")
@@ -48,8 +48,10 @@ MIME_TO_EXT = {
 }
 EXT_TO_MIME = {v: k for k, v in MIME_TO_EXT.items()}
 EXT_TO_MIME["jpg"] = "image/jpeg"
+EXT_TO_MIME["jpeg"] = "image/jpeg"
 
 SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9\.\-]+$")
+ID_RE = re.compile(r"^[a-f0-9]{12}$", re.IGNORECASE)
 
 def ts_utc() -> int:
     return int(time.time())
@@ -129,6 +131,24 @@ def validate_remote_url(raw: str) -> Tuple[str, str]:
         raise HTTPException(status_code=400, detail="Host not allowed")
     return raw, host
 
+def storage_path(filename: str) -> str:
+    return os.path.join(STORAGE_DIR, filename)
+
+def make_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+async def hash_file_sha256(path: str) -> str:
+    def _hash() -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    return await asyncio.to_thread(_hash)
+
 async def sniff_mime_and_verify(path: str) -> str:
     def _verify() -> str:
         with Image.open(path) as im:
@@ -148,26 +168,54 @@ async def sniff_mime_and_verify(path: str) -> str:
     except Exception:
         raise HTTPException(status_code=400, detail="Unsupported or invalid image")
 
-async def hash_file_sha256(path: str) -> str:
-    def _hash() -> str:
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(1024 * 1024)
-                if not chunk:
-                    break
-                h.update(chunk)
-        return h.hexdigest()
-    return await asyncio.to_thread(_hash)
+def choose_ext_from_mime(mime: str) -> str:
+    if mime in MIME_TO_EXT:
+        return MIME_TO_EXT[mime]
+    raise HTTPException(status_code=400, detail="Unsupported image type")
 
-def make_id() -> str:
-    return uuid.uuid4().hex[:12]
+def ext_from_filename(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    name = name.strip()
+    if "." not in name:
+        return None
+    ext = name.rsplit(".", 1)[-1].lower()
+    if ext == "jpeg":
+        ext = "jpg"
+    if ext in ("jpg", "png", "gif", "webp"):
+        return ext
+    return None
 
-def storage_path(filename: str) -> str:
-    return os.path.join(STORAGE_DIR, filename)
+def normalize_ext_for_mime(uploaded_ext: Optional[str], detected_mime: str) -> str:
+    detected_ext = choose_ext_from_mime(detected_mime)
+    if not uploaded_ext:
+        return detected_ext
+    if EXT_TO_MIME.get(uploaded_ext) == detected_mime:
+        return uploaded_ext
+    return detected_ext
 
 def compute_etag(size_bytes: int, sha256: str) -> str:
     return f'W/"{size_bytes}-{sha256[:16]}"'
+
+def build_urls(img_id: str, ext: str):
+    direct = f"{BASE_URL}/i/{img_id}.{ext}"
+    page = f"{BASE_URL}/v/{img_id}"
+    return direct, page
+
+def insert_image_record(img_id: str, filename: str, mime: str, size_bytes: int, sha256: str, expires_at: int):
+    con = db_connect()
+    con.execute(
+        "INSERT INTO images (id, filename, mime, size_bytes, sha256, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (img_id, filename, mime, size_bytes, sha256, ts_utc(), expires_at),
+    )
+    con.commit()
+    con.close()
+
+def get_image_record(img_id: str):
+    con = db_connect()
+    row = con.execute("SELECT * FROM images WHERE id = ?", (img_id,)).fetchone()
+    con.close()
+    return row
 
 class RateLimiter:
     def __init__(self, per_minute: int):
@@ -241,31 +289,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def choose_ext_from_mime(mime: str) -> str:
-    if mime in MIME_TO_EXT:
-        return MIME_TO_EXT[mime]
-    raise HTTPException(status_code=400, detail="Unsupported image type")
-
-def build_urls(img_id: str, ext: str):
-    direct = f"{BASE_URL}/i/{img_id}.{ext}"
-    page = f"{BASE_URL}/v/{img_id}"
-    return direct, page
-
-def insert_image_record(img_id: str, filename: str, mime: str, size_bytes: int, sha256: str, expires_at: int):
-    con = db_connect()
-    con.execute(
-        "INSERT INTO images (id, filename, mime, size_bytes, sha256, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (img_id, filename, mime, size_bytes, sha256, ts_utc(), expires_at),
-    )
-    con.commit()
-    con.close()
-
-def get_image_record(img_id: str):
-    con = db_connect()
-    row = con.execute("SELECT * FROM images WHERE id = ?", (img_id,)).fetchone()
-    con.close()
-    return row
-
 async def stream_download_to_file(url: str, out_path: str) -> int:
     size = 0
     timeout = httpx.Timeout(25.0, connect=10.0)
@@ -309,19 +332,21 @@ async def upload(req: Request, file: UploadFile = File(...)):
                 raise HTTPException(status_code=413, detail=f"Image too large (max {MAX_BYTES} bytes)")
             await f.write(chunk)
 
-    mime = await sniff_mime_and_verify(temp_path)
-    ext = choose_ext_from_mime(mime)
+    detected_mime = await sniff_mime_and_verify(temp_path)
     sha256 = await hash_file_sha256(temp_path)
+
+    uploaded_ext = ext_from_filename(file.filename)
+    ext = normalize_ext_for_mime(uploaded_ext, detected_mime)
 
     img_id = make_id()
     final_name = f"{img_id}.{ext}"
     os.replace(temp_path, storage_path(final_name))
 
     expires_at = int((now_utc() + timedelta(days=TTL_DAYS)).timestamp())
-    insert_image_record(img_id, final_name, mime, size, sha256, expires_at)
+    insert_image_record(img_id, final_name, detected_mime, size, sha256, expires_at)
 
     direct, page = build_urls(img_id, ext)
-    return JSONResponse({"id": img_id, "direct_url": direct, "page_url": page, "mime": mime, "size_bytes": size})
+    return JSONResponse({"id": img_id, "direct_url": direct, "page_url": page, "mime": detected_mime, "size_bytes": size})
 
 @app.post("/fetch")
 async def fetch(req: Request, url: str = Form(...)):
@@ -334,19 +359,19 @@ async def fetch(req: Request, url: str = Form(...)):
 
     try:
         size = await stream_download_to_file(url, temp_path)
-        mime = await sniff_mime_and_verify(temp_path)
-        ext = choose_ext_from_mime(mime)
+        detected_mime = await sniff_mime_and_verify(temp_path)
         sha256 = await hash_file_sha256(temp_path)
 
         img_id = make_id()
+        ext = choose_ext_from_mime(detected_mime)
         final_name = f"{img_id}.{ext}"
         os.replace(temp_path, storage_path(final_name))
 
         expires_at = int((now_utc() + timedelta(days=TTL_DAYS)).timestamp())
-        insert_image_record(img_id, final_name, mime, size, sha256, expires_at)
+        insert_image_record(img_id, final_name, detected_mime, size, sha256, expires_at)
 
         direct, page = build_urls(img_id, ext)
-        return JSONResponse({"id": img_id, "direct_url": direct, "page_url": page, "mime": mime, "size_bytes": size})
+        return JSONResponse({"id": img_id, "direct_url": direct, "page_url": page, "mime": detected_mime, "size_bytes": size})
     finally:
         if os.path.exists(temp_path):
             try:
@@ -356,10 +381,12 @@ async def fetch(req: Request, url: str = Form(...)):
 
 @app.get("/v/{img_id}", response_class=HTMLResponse)
 async def view(img_id: str):
+    if not ID_RE.match(img_id):
+        raise HTTPException(status_code=404, detail="Not found")
     row = get_image_record(img_id)
     if not row:
         raise HTTPException(status_code=404, detail="Not found")
-    ext = row["filename"].split(".")[-1].lower()
+    ext = row["filename"].rsplit(".", 1)[-1].lower()
     direct, _ = build_urls(img_id, ext)
     html = f"""
     <!doctype html>
@@ -388,7 +415,6 @@ async def image(img_file: str, req: Request):
         raise HTTPException(status_code=404, detail="Not found")
 
     etag = compute_etag(row["size_bytes"], row["sha256"])
-
     if req.headers.get("if-none-match") == etag:
         return JSONResponse(status_code=304)
 
@@ -400,6 +426,3 @@ async def image(img_file: str, req: Request):
             "Cache-Control": "public, max-age=31536000, immutable",
         },
     )
-
-
-
