@@ -387,4 +387,19 @@ async def image(img_file: str, req: Request):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Not found")
 
-    etag
+    etag = compute_etag(row["size_bytes"], row["sha256"])
+
+    if req.headers.get("if-none-match") == etag:
+        return JSONResponse(status_code=304)
+
+    return FileResponse(
+        path,
+        media_type=row["mime"],
+        headers={
+            "ETag": etag,
+            "Cache-Control": "public, max-age=31536000, immutable",
+        },
+    )
+
+
+
