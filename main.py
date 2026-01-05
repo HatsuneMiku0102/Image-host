@@ -4,29 +4,31 @@ import ipaddress
 import os
 import re
 import socket
-import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
-import aiofiles
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from PIL import Image
+from pymongo import ASCENDING
 
 APP_NAME = os.getenv("APP_NAME", "MikuMiku Image Host")
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
-STORAGE_DIR = os.getenv("STORAGE_DIR", "/tmp/mikumiku").rstrip("/")
-DB_PATH = os.getenv("DB_PATH", "/tmp/mikumiku/db.sqlite").strip()
 MAX_BYTES = int(os.getenv("MAX_BYTES", str(10 * 1024 * 1024)))
 TTL_DAYS = int(os.getenv("TTL_DAYS", "30"))
 UPLOADS_PER_MINUTE = int(os.getenv("UPLOADS_PER_MINUTE", "30"))
 CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "600"))
+
+MONGO_URL = os.getenv("MONGO_URL", "").strip()
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "mikumiku_image_host").strip()
 
 ALLOWED_ORIGINS = [
     "https://mikumiku.dev",
@@ -35,9 +37,6 @@ ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:8000",
 ]
-
-os.makedirs(STORAGE_DIR, exist_ok=True)
-os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
 MIME_TO_EXT = {
     "image/jpeg": "jpg",
@@ -59,29 +58,16 @@ def ts_utc() -> int:
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-def init_db() -> None:
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS images (
-            id TEXT PRIMARY KEY,
-            filename TEXT NOT NULL,
-            mime TEXT NOT NULL,
-            size_bytes INTEGER NOT NULL,
-            sha256 TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            expires_at INTEGER NOT NULL
-        )
-        """
-    )
-    con.execute("CREATE INDEX IF NOT EXISTS idx_images_expires ON images(expires_at)")
-    con.commit()
-    con.close()
+def make_id() -> str:
+    return uuid.uuid4().hex[:12]
 
-def db_connect():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+def compute_etag(size_bytes: int, sha256: str) -> str:
+    return f'W/"{size_bytes}-{sha256[:16]}"'
+
+def build_urls(img_id: str, ext: str):
+    direct = f"{BASE_URL}/i/{img_id}.{ext}"
+    page = f"{BASE_URL}/v/{img_id}"
+    return direct, page
 
 def ip_is_public(ip: str) -> bool:
     try:
@@ -131,43 +117,6 @@ def validate_remote_url(raw: str) -> Tuple[str, str]:
         raise HTTPException(status_code=400, detail="Host not allowed")
     return raw, host
 
-def storage_path(filename: str) -> str:
-    return os.path.join(STORAGE_DIR, filename)
-
-def make_id() -> str:
-    return uuid.uuid4().hex[:12]
-
-async def hash_file_sha256(path: str) -> str:
-    def _hash() -> str:
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(1024 * 1024)
-                if not chunk:
-                    break
-                h.update(chunk)
-        return h.hexdigest()
-    return await asyncio.to_thread(_hash)
-
-async def sniff_mime_and_verify(path: str) -> str:
-    def _verify() -> str:
-        with Image.open(path) as im:
-            im.verify()
-            fmt = (im.format or "").upper()
-        if fmt == "JPEG":
-            return "image/jpeg"
-        if fmt == "PNG":
-            return "image/png"
-        if fmt == "GIF":
-            return "image/gif"
-        if fmt == "WEBP":
-            return "image/webp"
-        raise ValueError("Unsupported image type")
-    try:
-        return await asyncio.to_thread(_verify)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Unsupported or invalid image")
-
 def choose_ext_from_mime(mime: str) -> str:
     if mime in MIME_TO_EXT:
         return MIME_TO_EXT[mime]
@@ -176,10 +125,9 @@ def choose_ext_from_mime(mime: str) -> str:
 def ext_from_filename(name: Optional[str]) -> Optional[str]:
     if not name:
         return None
-    name = name.strip()
     if "." not in name:
         return None
-    ext = name.rsplit(".", 1)[-1].lower()
+    ext = name.rsplit(".", 1)[-1].lower().strip()
     if ext == "jpeg":
         ext = "jpg"
     if ext in ("jpg", "png", "gif", "webp"):
@@ -194,28 +142,25 @@ def normalize_ext_for_mime(uploaded_ext: Optional[str], detected_mime: str) -> s
         return uploaded_ext
     return detected_ext
 
-def compute_etag(size_bytes: int, sha256: str) -> str:
-    return f'W/"{size_bytes}-{sha256[:16]}"'
+def sniff_mime_and_verify_bytes(data: bytes) -> str:
+    try:
+        with Image.open(BytesIO(data)) as im:
+            im.verify()
+            fmt = (im.format or "").upper()
+        if fmt == "JPEG":
+            return "image/jpeg"
+        if fmt == "PNG":
+            return "image/png"
+        if fmt == "GIF":
+            return "image/gif"
+        if fmt == "WEBP":
+            return "image/webp"
+        raise ValueError("Unsupported")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Unsupported or invalid image")
 
-def build_urls(img_id: str, ext: str):
-    direct = f"{BASE_URL}/i/{img_id}.{ext}"
-    page = f"{BASE_URL}/v/{img_id}"
-    return direct, page
-
-def insert_image_record(img_id: str, filename: str, mime: str, size_bytes: int, sha256: str, expires_at: int):
-    con = db_connect()
-    con.execute(
-        "INSERT INTO images (id, filename, mime, size_bytes, sha256, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (img_id, filename, mime, size_bytes, sha256, ts_utc(), expires_at),
-    )
-    con.commit()
-    con.close()
-
-def get_image_record(img_id: str):
-    con = db_connect()
-    row = con.execute("SELECT * FROM images WHERE id = ?", (img_id,)).fetchone()
-    con.close()
-    return row
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 class RateLimiter:
     def __init__(self, per_minute: int):
@@ -235,26 +180,28 @@ class RateLimiter:
         return True
 
 limiter = RateLimiter(UPLOADS_PER_MINUTE)
+
+mongo_client: Optional[AsyncIOMotorClient] = None
+db = None
+fs: Optional[AsyncIOMotorGridFSBucket] = None
 cleanup_task: Optional[asyncio.Task] = None
+
+async def ensure_indexes():
+    await db.images.create_index([("expires_at", ASCENDING)])
+    await db.images.create_index([("created_at", ASCENDING)])
 
 async def cleanup_once():
     cutoff = ts_utc()
-    con = db_connect()
-    rows = con.execute("SELECT id, filename FROM images WHERE expires_at <= ?", (cutoff,)).fetchall()
-    con.close()
-    if not rows:
+    cursor = db.images.find({"expires_at": {"$lte": cutoff}}, {"_id": 1, "file_id": 1})
+    doomed = await cursor.to_list(length=2000)
+    if not doomed:
         return
-    for r in rows:
-        path = storage_path(r["filename"])
-        if os.path.exists(path):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-        con2 = db_connect()
-        con2.execute("DELETE FROM images WHERE id = ?", (r["id"],))
-        con2.commit()
-        con2.close()
+    for d in doomed:
+        try:
+            await fs.delete(d["file_id"])
+        except Exception:
+            pass
+        await db.images.delete_one({"_id": d["_id"]})
 
 async def cleanup_loop():
     while True:
@@ -266,8 +213,13 @@ async def cleanup_loop():
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global cleanup_task
-    init_db()
+    global mongo_client, db, fs, cleanup_task
+    if not MONGO_URL:
+        raise RuntimeError("MONGO_URL is not set")
+    mongo_client = AsyncIOMotorClient(MONGO_URL)
+    db = mongo_client[MONGO_DB_NAME]
+    fs = AsyncIOMotorGridFSBucket(db)
+    await ensure_indexes()
     cleanup_task = asyncio.create_task(cleanup_loop())
     try:
         yield
@@ -278,6 +230,8 @@ async def lifespan(_app: FastAPI):
                 await cleanup_task
             except Exception:
                 pass
+        if mongo_client:
+            mongo_client.close()
 
 app = FastAPI(title=APP_NAME, lifespan=lifespan)
 
@@ -289,22 +243,65 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def stream_download_to_file(url: str, out_path: str) -> int:
+async def read_uploadfile_limited(file: UploadFile) -> bytes:
+    total = 0
+    chunks = []
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_BYTES:
+            raise HTTPException(status_code=413, detail=f"Image too large (max {MAX_BYTES} bytes)")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+async def download_limited(url: str) -> bytes:
     size = 0
+    buf = bytearray()
     timeout = httpx.Timeout(25.0, connect=10.0)
     headers = {"User-Agent": f"{APP_NAME}/1.0"}
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
         async with client.stream("GET", url) as r:
             r.raise_for_status()
-            async with aiofiles.open(out_path, "wb") as f:
-                async for chunk in r.aiter_bytes():
-                    if not chunk:
-                        continue
-                    size += len(chunk)
-                    if size > MAX_BYTES:
-                        raise HTTPException(status_code=413, detail=f"Image too large (max {MAX_BYTES} bytes)")
-                    await f.write(chunk)
-    return size
+            async for chunk in r.aiter_bytes():
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > MAX_BYTES:
+                    raise HTTPException(status_code=413, detail=f"Image too large (max {MAX_BYTES} bytes)")
+                buf.extend(chunk)
+    return bytes(buf)
+
+def client_ip(req: Request) -> str:
+    ip = (req.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    return ip or (req.client.host if req.client else "unknown")
+
+async def store_image_bytes(data: bytes, uploaded_ext: Optional[str]) -> dict:
+    detected_mime = sniff_mime_and_verify_bytes(data)
+    ext = normalize_ext_for_mime(uploaded_ext, detected_mime)
+    size = len(data)
+    sha = sha256_bytes(data)
+    img_id = make_id()
+    expires_at = int((now_utc() + timedelta(days=TTL_DAYS)).timestamp())
+    file_id = await fs.upload_from_stream(
+        filename=f"{img_id}.{ext}",
+        source=BytesIO(data),
+        metadata={"id": img_id, "ext": ext, "mime": detected_mime, "sha256": sha, "size_bytes": size},
+    )
+    doc = {
+        "_id": img_id,
+        "file_id": file_id,
+        "ext": ext,
+        "mime": detected_mime,
+        "size_bytes": size,
+        "sha256": sha,
+        "created_at": ts_utc(),
+        "expires_at": expires_at,
+    }
+    await db.images.insert_one(doc)
+    direct, page = build_urls(img_id, ext)
+    return {"id": img_id, "direct_url": direct, "page_url": page, "mime": detected_mime, "size_bytes": size}
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -312,82 +309,32 @@ async def root():
 
 @app.post("/upload")
 async def upload(req: Request, file: UploadFile = File(...)):
-    ip = (req.headers.get("x-forwarded-for") or "").split(",")[0].strip() or (req.client.host if req.client else "unknown")
+    ip = client_ip(req)
     if not limiter.allow(ip):
         raise HTTPException(status_code=429, detail="Too many uploads, try again later")
-
-    temp_path = storage_path(f"tmp_{uuid.uuid4().hex}")
-    size = 0
-    async with aiofiles.open(temp_path, "wb") as f:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > MAX_BYTES:
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
-                raise HTTPException(status_code=413, detail=f"Image too large (max {MAX_BYTES} bytes)")
-            await f.write(chunk)
-
-    detected_mime = await sniff_mime_and_verify(temp_path)
-    sha256 = await hash_file_sha256(temp_path)
-
+    data = await read_uploadfile_limited(file)
     uploaded_ext = ext_from_filename(file.filename)
-    ext = normalize_ext_for_mime(uploaded_ext, detected_mime)
-
-    img_id = make_id()
-    final_name = f"{img_id}.{ext}"
-    os.replace(temp_path, storage_path(final_name))
-
-    expires_at = int((now_utc() + timedelta(days=TTL_DAYS)).timestamp())
-    insert_image_record(img_id, final_name, detected_mime, size, sha256, expires_at)
-
-    direct, page = build_urls(img_id, ext)
-    return JSONResponse({"id": img_id, "direct_url": direct, "page_url": page, "mime": detected_mime, "size_bytes": size})
+    out = await store_image_bytes(data, uploaded_ext)
+    return JSONResponse(out)
 
 @app.post("/fetch")
 async def fetch(req: Request, url: str = Form(...)):
-    ip = (req.headers.get("x-forwarded-for") or "").split(",")[0].strip() or (req.client.host if req.client else "unknown")
+    ip = client_ip(req)
     if not limiter.allow(ip):
         raise HTTPException(status_code=429, detail="Too many uploads, try again later")
-
     url, _ = validate_remote_url(url)
-    temp_path = storage_path(f"tmp_{uuid.uuid4().hex}")
-
-    try:
-        size = await stream_download_to_file(url, temp_path)
-        detected_mime = await sniff_mime_and_verify(temp_path)
-        sha256 = await hash_file_sha256(temp_path)
-
-        img_id = make_id()
-        ext = choose_ext_from_mime(detected_mime)
-        final_name = f"{img_id}.{ext}"
-        os.replace(temp_path, storage_path(final_name))
-
-        expires_at = int((now_utc() + timedelta(days=TTL_DAYS)).timestamp())
-        insert_image_record(img_id, final_name, detected_mime, size, sha256, expires_at)
-
-        direct, page = build_urls(img_id, ext)
-        return JSONResponse({"id": img_id, "direct_url": direct, "page_url": page, "mime": detected_mime, "size_bytes": size})
-    finally:
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+    data = await download_limited(url)
+    out = await store_image_bytes(data, None)
+    return JSONResponse(out)
 
 @app.get("/v/{img_id}", response_class=HTMLResponse)
 async def view(img_id: str):
     if not ID_RE.match(img_id):
         raise HTTPException(status_code=404, detail="Not found")
-    row = get_image_record(img_id)
+    row = await db.images.find_one({"_id": img_id})
     if not row:
         raise HTTPException(status_code=404, detail="Not found")
-    ext = row["filename"].rsplit(".", 1)[-1].lower()
-    direct, _ = build_urls(img_id, ext)
+    direct, _ = build_urls(img_id, row["ext"])
     html = f"""
     <!doctype html>
     <html><head><meta charset="utf-8"><title>{APP_NAME} - {img_id}</title></head>
@@ -404,25 +351,27 @@ async def image(img_file: str, req: Request):
     m = re.fullmatch(r"([a-f0-9]{12})\.(jpg|png|gif|webp)", img_file.lower())
     if not m:
         raise HTTPException(status_code=404, detail="Not found")
-
     img_id = m.group(1)
-    row = get_image_record(img_id)
+    row = await db.images.find_one({"_id": img_id})
     if not row:
-        raise HTTPException(status_code=404, detail="Not found")
-
-    path = storage_path(row["filename"])
-    if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Not found")
 
     etag = compute_etag(row["size_bytes"], row["sha256"])
     if req.headers.get("if-none-match") == etag:
         return JSONResponse(status_code=304)
 
-    return FileResponse(
-        path,
-        media_type=row["mime"],
-        headers={
-            "ETag": etag,
-            "Cache-Control": "public, max-age=31536000, immutable",
-        },
-    )
+    grid_out = await fs.open_download_stream(row["file_id"])
+
+    async def gen():
+        while True:
+            chunk = await grid_out.readchunk()
+            if not chunk:
+                break
+            yield chunk
+
+    headers = {
+        "ETag": etag,
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Content-Length": str(row["size_bytes"]),
+    }
+    return StreamingResponse(gen(), media_type=row["mime"], headers=headers)
