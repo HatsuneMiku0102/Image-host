@@ -1,4 +1,7 @@
-const API_URL = "/image-api";
+const API_URL =
+  location.hostname === "localhost"
+    ? "/image-api"
+    : "https://mikumiku.dev/image-api";
 
 const uploadForm = document.getElementById("uploadForm");
 const uploadFile = document.getElementById("uploadFile");
