@@ -491,57 +491,21 @@ async def image(img_file: str, req: Request):
     return StreamingResponse(gen(), media_type=row["mime"], headers=headers)
 
 @app.post("/admin/keys/create")
-async def admin_create_key(
-    req: Request,
-    name: str = Form("key"),
-    scopes: str = Form("upload,fetch"),
-    rate_per_minute: int = Form(30),
-    never_expires: int = Form(1),
-    expires_in_days: int = Form(0),
-    _=Depends(require_admin),
-):
-    raw, key_id, secret = generate_key()
-    salt = secrets.token_bytes(PBKDF2_SALT_BYTES)
-    iters = PBKDF2_ITERATIONS
-    hsh = pbkdf2_hash(secret, salt, iters)
-
-    scopes_list = [s.strip() for s in (scopes or "").split(",") if s.strip()]
-    if not scopes_list:
-        scopes_list = ["upload", "fetch"]
-
-    exp = None
-    if not never_expires:
-        if expires_in_days <= 0:
-            expires_in_days = 30
-        exp = int((now_utc() + timedelta(days=expires_in_days)).timestamp())
-
+async def admin_create_key(req: Request, name: str = Form("sharex"), _=Depends(require_admin)):
+    raw = "mk_" + secrets.token_urlsafe(32)
+    key_hash = sha256_hex(raw)
     doc = {
-        "key_id": key_id,
+        "key_hash": key_hash,
         "name": (name or "key")[:64],
-        "salt_b64": b64url(salt),
-        "hash_b64": hsh,
-        "iters": iters,
-        "scopes": scopes_list,
-        "rate_per_minute": int(rate_per_minute or 0),
         "revoked": False,
         "created_at": ts_utc(),
-        "expires_at": exp,
-        "last_used_at": None,
-        "last_used_ip": None,
     }
     try:
         await db.api_keys.insert_one(doc)
-    except Exception:
-        raise HTTPException(status_code=500, detail="Could not create key")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not create key: {type(e).__name__}: {str(e)}")
+    return JSONResponse({"api_key": raw})
 
-    return JSONResponse({
-        "api_key": raw,
-        "key_id": key_id,
-        "name": doc["name"],
-        "scopes": doc["scopes"],
-        "rate_per_minute": doc["rate_per_minute"],
-        "expires_at": doc["expires_at"],
-    })
 
 @app.get("/admin/keys/list")
 async def admin_list_keys(req: Request, limit: int = 100, _=Depends(require_admin)):
