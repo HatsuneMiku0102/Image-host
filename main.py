@@ -225,11 +225,17 @@ async def ensure_indexes():
     await db.images.create_index([("expires_at", ASCENDING)])
     await db.images.create_index([("created_at", ASCENDING)])
 
-    await db.api_keys.create_index([("key_id", ASCENDING)], unique=True)
+    await db.api_keys.create_index(
+        [("key_id", ASCENDING)],
+        unique=True,
+        partialFilterExpression={"key_id": {"$type": "string"}},
+        name="key_id_unique_string",
+    )
     await db.api_keys.create_index([("revoked", ASCENDING)])
     await db.api_keys.create_index([("created_at", DESCENDING)])
     await db.api_keys.create_index([("last_used_at", DESCENDING)])
     await db.api_keys.create_index([("expires_at", ASCENDING)])
+
 
 async def cleanup_once():
     cutoff = ts_utc()
