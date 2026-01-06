@@ -282,6 +282,13 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title=APP_NAME, lifespan=lifespan)
 
+APP_VERSION = os.getenv("APP_VERSION", "dev")
+
+@app.get("/debug/version")
+async def debug_version():
+    return JSONResponse({"version": APP_VERSION})
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
