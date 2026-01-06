@@ -3,6 +3,7 @@ import hashlib
 import ipaddress
 import os
 import re
+import secrets
 import socket
 import time
 import uuid
@@ -13,7 +14,7 @@ from typing import Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
@@ -29,6 +30,9 @@ CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "600"))
 
 MONGO_URL = os.getenv("MONGO_URL", "").strip()
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "mikumiku_image_host").strip()
+
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
+REQUIRE_API_KEY = os.getenv("REQUIRE_API_KEY", "1").strip() not in ("0", "false", "False", "")
 
 ALLOWED_ORIGINS = [
     "https://mikumiku.dev",
@@ -162,6 +166,9 @@ def sniff_mime_and_verify_bytes(data: bytes) -> str:
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
+def sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
 class RateLimiter:
     def __init__(self, per_minute: int):
         self.per_minute = per_minute
@@ -189,6 +196,9 @@ cleanup_task: Optional[asyncio.Task] = None
 async def ensure_indexes():
     await db.images.create_index([("expires_at", ASCENDING)])
     await db.images.create_index([("created_at", ASCENDING)])
+    await db.api_keys.create_index([("key_hash", ASCENDING)], unique=True)
+    await db.api_keys.create_index([("revoked", ASCENDING)])
+    await db.api_keys.create_index([("created_at", ASCENDING)])
 
 async def cleanup_once():
     cutoff = ts_utc()
@@ -243,6 +253,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def client_ip(req: Request) -> str:
+    ip = (req.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    return ip or (req.client.host if req.client else "unknown")
+
 async def read_uploadfile_limited(file: UploadFile) -> bytes:
     total = 0
     chunks = []
@@ -273,9 +287,26 @@ async def download_limited(url: str) -> bytes:
                 buf.extend(chunk)
     return bytes(buf)
 
-def client_ip(req: Request) -> str:
-    ip = (req.headers.get("x-forwarded-for") or "").split(",")[0].strip()
-    return ip or (req.client.host if req.client else "unknown")
+async def verify_api_key(req: Request):
+    if not REQUIRE_API_KEY:
+        return
+    auth = (req.headers.get("authorization") or "").strip()
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing API key")
+    key = auth.split(" ", 1)[1].strip()
+    if not key:
+        raise HTTPException(status_code=401, detail="Missing API key")
+    key_hash = sha256_hex(key)
+    doc = await db.api_keys.find_one({"key_hash": key_hash, "revoked": {"$ne": True}})
+    if not doc:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+async def require_admin(req: Request):
+    if not ADMIN_SECRET:
+        raise HTTPException(status_code=500, detail="Admin not configured")
+    supplied = (req.headers.get("x-admin-secret") or "").strip()
+    if not supplied or supplied != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
 async def store_image_bytes(data: bytes, uploaded_ext: Optional[str]) -> dict:
     detected_mime = sniff_mime_and_verify_bytes(data)
@@ -284,22 +315,26 @@ async def store_image_bytes(data: bytes, uploaded_ext: Optional[str]) -> dict:
     sha = sha256_bytes(data)
     img_id = make_id()
     expires_at = int((now_utc() + timedelta(days=TTL_DAYS)).timestamp())
+
     file_id = await fs.upload_from_stream(
         filename=f"{img_id}.{ext}",
         source=BytesIO(data),
         metadata={"id": img_id, "ext": ext, "mime": detected_mime, "sha256": sha, "size_bytes": size},
     )
-    doc = {
-        "_id": img_id,
-        "file_id": file_id,
-        "ext": ext,
-        "mime": detected_mime,
-        "size_bytes": size,
-        "sha256": sha,
-        "created_at": ts_utc(),
-        "expires_at": expires_at,
-    }
-    await db.images.insert_one(doc)
+
+    await db.images.insert_one(
+        {
+            "_id": img_id,
+            "file_id": file_id,
+            "ext": ext,
+            "mime": detected_mime,
+            "size_bytes": size,
+            "sha256": sha,
+            "created_at": ts_utc(),
+            "expires_at": expires_at,
+        }
+    )
+
     direct, page = build_urls(img_id, ext)
     return {"id": img_id, "direct_url": direct, "page_url": page, "mime": detected_mime, "size_bytes": size}
 
@@ -308,7 +343,7 @@ async def root():
     return HTMLResponse("<h3>MikuMiku Image Host running</h3><p>Try /docs</p>")
 
 @app.post("/upload")
-async def upload(req: Request, file: UploadFile = File(...)):
+async def upload(req: Request, file: UploadFile = File(...), _=Depends(verify_api_key)):
     ip = client_ip(req)
     if not limiter.allow(ip):
         raise HTTPException(status_code=429, detail="Too many uploads, try again later")
@@ -318,11 +353,11 @@ async def upload(req: Request, file: UploadFile = File(...)):
     return JSONResponse(out)
 
 @app.post("/fetch")
-async def fetch(req: Request, url: str = Form(...)):
+async def fetch(req: Request, url: str = Form(...), _=Depends(verify_api_key)):
     ip = client_ip(req)
     if not limiter.allow(ip):
         raise HTTPException(status_code=429, detail="Too many uploads, try again later")
-    url, _ = validate_remote_url(url)
+    url, _h = validate_remote_url(url)
     data = await download_limited(url)
     out = await store_image_bytes(data, None)
     return JSONResponse(out)
@@ -375,3 +410,27 @@ async def image(img_file: str, req: Request):
         "Content-Length": str(row["size_bytes"]),
     }
     return StreamingResponse(gen(), media_type=row["mime"], headers=headers)
+
+@app.post("/admin/keys")
+async def admin_create_key(req: Request, name: str = Form("sharex"), _=Depends(require_admin)):
+    raw = "mk_" + secrets.token_urlsafe(32)
+    key_hash = sha256_hex(raw)
+    doc = {
+        "key_hash": key_hash,
+        "name": (name or "key")[:64],
+        "revoked": False,
+        "created_at": ts_utc(),
+    }
+    try:
+        await db.api_keys.insert_one(doc)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Could not create key")
+    return JSONResponse({"api_key": raw})
+
+@app.post("/admin/keys/revoke")
+async def admin_revoke_key(req: Request, api_key: str = Form(...), _=Depends(require_admin)):
+    key_hash = sha256_hex(api_key.strip())
+    r = await db.api_keys.update_one({"key_hash": key_hash}, {"$set": {"revoked": True, "revoked_at": ts_utc()}})
+    if r.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Key not found")
+    return JSONResponse({"revoked": True})
