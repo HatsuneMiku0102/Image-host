@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import hashlib
+import hmac
 import ipaddress
 import os
 import re
@@ -11,7 +13,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from typing import Optional, Tuple
-from urllib.parse import urlparse
 
 import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -19,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from PIL import Image
-from pymongo import ASCENDING
+from pymongo import ASCENDING, DESCENDING
 
 APP_NAME = os.getenv("APP_NAME", "MikuMiku Image Host")
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
@@ -33,6 +34,9 @@ MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "mikumiku_image_host").strip()
 
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "").strip()
 REQUIRE_API_KEY = os.getenv("REQUIRE_API_KEY", "1").strip() not in ("0", "false", "False", "")
+
+PBKDF2_ITERATIONS = int(os.getenv("APIKEY_PBKDF2_ITERS", "210000"))
+PBKDF2_SALT_BYTES = int(os.getenv("APIKEY_SALT_BYTES", "16"))
 
 ALLOWED_ORIGINS = [
     "https://mikumiku.dev",
@@ -55,6 +59,7 @@ EXT_TO_MIME["jpeg"] = "image/jpeg"
 
 SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9\.\-]+$")
 ID_RE = re.compile(r"^[a-f0-9]{12}$", re.IGNORECASE)
+KEY_RE = re.compile(r"^mk_([A-Za-z0-9]{12})_([A-Za-z0-9\-_]{32,})$")
 
 def ts_utc() -> int:
     return int(time.time())
@@ -62,7 +67,7 @@ def ts_utc() -> int:
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-def make_id() -> str:
+def make_id12() -> str:
     return uuid.uuid4().hex[:12]
 
 def compute_etag(size_bytes: int, sha256: str) -> str:
@@ -109,12 +114,10 @@ def validate_remote_url(raw: str) -> Tuple[str, str]:
     raw = raw.strip()
     if len(raw) > 2048:
         raise HTTPException(status_code=400, detail="URL too long")
-    parsed = urlparse(raw)
+    parsed = httpx.URL(raw)
     if parsed.scheme not in ("http", "https"):
         raise HTTPException(status_code=400, detail="Only http/https allowed")
-    if not parsed.netloc:
-        raise HTTPException(status_code=400, detail="Invalid URL")
-    host = parsed.hostname or ""
+    host = parsed.host or ""
     if not host or not SAFE_HOST_RE.match(host):
         raise HTTPException(status_code=400, detail="Invalid host")
     if not resolve_public_ips(host):
@@ -166,10 +169,35 @@ def sniff_mime_and_verify_bytes(data: bytes) -> str:
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
-def sha256_hex(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
 
-class RateLimiter:
+def pbkdf2_hash(secret: str, salt: bytes, iters: int) -> str:
+    dk = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, iters, dklen=32)
+    return b64url(dk)
+
+def parse_bearer(req: Request) -> str:
+    auth = (req.headers.get("authorization") or "").strip()
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing API key")
+    key = auth.split(" ", 1)[1].strip()
+    if not key:
+        raise HTTPException(status_code=401, detail="Missing API key")
+    return key
+
+def parse_key(raw: str) -> Tuple[str, str]:
+    m = KEY_RE.match(raw.strip())
+    if not m:
+        raise HTTPException(status_code=401, detail="Invalid API key format")
+    return m.group(1), m.group(2)
+
+def generate_key() -> Tuple[str, str, str]:
+    key_id = make_id12()
+    secret = secrets.token_urlsafe(32)
+    raw = f"mk_{key_id}_{secret}"
+    return raw, key_id, secret
+
+class SlidingWindowLimiter:
     def __init__(self, per_minute: int):
         self.per_minute = per_minute
         self.buckets: dict[str, list[int]] = {}
@@ -186,7 +214,7 @@ class RateLimiter:
         self.buckets[key] = arr
         return True
 
-limiter = RateLimiter(UPLOADS_PER_MINUTE)
+limiter_ip = SlidingWindowLimiter(UPLOADS_PER_MINUTE)
 
 mongo_client: Optional[AsyncIOMotorClient] = None
 db = None
@@ -196,9 +224,12 @@ cleanup_task: Optional[asyncio.Task] = None
 async def ensure_indexes():
     await db.images.create_index([("expires_at", ASCENDING)])
     await db.images.create_index([("created_at", ASCENDING)])
-    await db.api_keys.create_index([("key_hash", ASCENDING)], unique=True)
+
+    await db.api_keys.create_index([("key_id", ASCENDING)], unique=True)
     await db.api_keys.create_index([("revoked", ASCENDING)])
-    await db.api_keys.create_index([("created_at", ASCENDING)])
+    await db.api_keys.create_index([("created_at", DESCENDING)])
+    await db.api_keys.create_index([("last_used_at", DESCENDING)])
+    await db.api_keys.create_index([("expires_at", ASCENDING)])
 
 async def cleanup_once():
     cutoff = ts_utc()
@@ -287,33 +318,12 @@ async def download_limited(url: str) -> bytes:
                 buf.extend(chunk)
     return bytes(buf)
 
-async def verify_api_key(req: Request):
-    if not REQUIRE_API_KEY:
-        return
-    auth = (req.headers.get("authorization") or "").strip()
-    if not auth.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing API key")
-    key = auth.split(" ", 1)[1].strip()
-    if not key:
-        raise HTTPException(status_code=401, detail="Missing API key")
-    key_hash = sha256_hex(key)
-    doc = await db.api_keys.find_one({"key_hash": key_hash, "revoked": {"$ne": True}})
-    if not doc:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-async def require_admin(req: Request):
-    if not ADMIN_SECRET:
-        raise HTTPException(status_code=500, detail="Admin not configured")
-    supplied = (req.headers.get("x-admin-secret") or "").strip()
-    if not supplied or supplied != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
 async def store_image_bytes(data: bytes, uploaded_ext: Optional[str]) -> dict:
     detected_mime = sniff_mime_and_verify_bytes(data)
     ext = normalize_ext_for_mime(uploaded_ext, detected_mime)
     size = len(data)
     sha = sha256_bytes(data)
-    img_id = make_id()
+    img_id = make_id12()
     expires_at = int((now_utc() + timedelta(days=TTL_DAYS)).timestamp())
 
     file_id = await fs.upload_from_stream(
@@ -338,25 +348,88 @@ async def store_image_bytes(data: bytes, uploaded_ext: Optional[str]) -> dict:
     direct, page = build_urls(img_id, ext)
     return {"id": img_id, "direct_url": direct, "page_url": page, "mime": detected_mime, "size_bytes": size}
 
+async def require_admin(req: Request):
+    if not ADMIN_SECRET:
+        raise HTTPException(status_code=500, detail="Admin not configured")
+    supplied = (req.headers.get("x-admin-secret") or "").strip()
+    if not supplied or supplied != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+async def verify_api_key(req: Request):
+    if not REQUIRE_API_KEY:
+        return {"key_id": None, "scopes": ["upload", "fetch"], "rate_per_minute": UPLOADS_PER_MINUTE}
+
+    raw = parse_bearer(req)
+    key_id, secret = parse_key(raw)
+
+    doc = await db.api_keys.find_one({"key_id": key_id})
+    if not doc:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    if doc.get("revoked"):
+        raise HTTPException(status_code=401, detail="API key revoked")
+
+    expires_at = doc.get("expires_at")
+    if expires_at is not None and isinstance(expires_at, int) and ts_utc() >= expires_at:
+        raise HTTPException(status_code=401, detail="API key expired")
+
+    salt_b64 = doc.get("salt_b64")
+    iters = int(doc.get("iters") or PBKDF2_ITERATIONS)
+    stored_hash = doc.get("hash_b64")
+    if not salt_b64 or not stored_hash:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    try:
+        salt = base64.urlsafe_b64decode(salt_b64 + "==")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    computed = pbkdf2_hash(secret, salt, iters)
+    if not hmac.compare_digest(computed, stored_hash):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    scopes = doc.get("scopes") or ["upload", "fetch"]
+    rate_per_minute = int(doc.get("rate_per_minute") or UPLOADS_PER_MINUTE)
+
+    ip = client_ip(req)
+    if rate_per_minute > 0:
+        k = f"key:{key_id}"
+        limiter_key = SlidingWindowLimiter(rate_per_minute)
+        if not limiter_key.allow(k):
+            raise HTTPException(status_code=429, detail="Too many requests for this API key")
+
+    await db.api_keys.update_one(
+        {"key_id": key_id},
+        {"$set": {"last_used_at": ts_utc(), "last_used_ip": ip}},
+    )
+
+    return {"key_id": key_id, "scopes": scopes, "rate_per_minute": rate_per_minute}
+
+def require_scope(scopes: list[str], needed: str):
+    if needed not in scopes:
+        raise HTTPException(status_code=403, detail="Insufficient scope")
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
     return HTMLResponse("<h3>MikuMiku Image Host running</h3><p>Try /docs</p>")
 
 @app.post("/upload")
-async def upload(req: Request, file: UploadFile = File(...), _=Depends(verify_api_key)):
+async def upload(req: Request, file: UploadFile = File(...), k=Depends(verify_api_key)):
     ip = client_ip(req)
-    if not limiter.allow(ip):
+    if not limiter_ip.allow(ip):
         raise HTTPException(status_code=429, detail="Too many uploads, try again later")
+    require_scope(k["scopes"], "upload")
     data = await read_uploadfile_limited(file)
     uploaded_ext = ext_from_filename(file.filename)
     out = await store_image_bytes(data, uploaded_ext)
     return JSONResponse(out)
 
 @app.post("/fetch")
-async def fetch(req: Request, url: str = Form(...), _=Depends(verify_api_key)):
+async def fetch(req: Request, url: str = Form(...), k=Depends(verify_api_key)):
     ip = client_ip(req)
-    if not limiter.allow(ip):
+    if not limiter_ip.allow(ip):
         raise HTTPException(status_code=429, detail="Too many uploads, try again later")
+    require_scope(k["scopes"], "fetch")
     url, _h = validate_remote_url(url)
     data = await download_limited(url)
     out = await store_image_bytes(data, None)
@@ -411,30 +484,84 @@ async def image(img_file: str, req: Request):
     }
     return StreamingResponse(gen(), media_type=row["mime"], headers=headers)
 
-@app.post("/admin/keys")
-async def admin_create_key(req: Request, name: str = Form("sharex"), _=Depends(require_admin)):
-    raw = "mk_" + secrets.token_urlsafe(32)
-    key_hash = sha256_hex(raw)
+@app.post("/admin/keys/create")
+async def admin_create_key(
+    req: Request,
+    name: str = Form("key"),
+    scopes: str = Form("upload,fetch"),
+    rate_per_minute: int = Form(30),
+    never_expires: int = Form(1),
+    expires_in_days: int = Form(0),
+    _=Depends(require_admin),
+):
+    raw, key_id, secret = generate_key()
+    salt = secrets.token_bytes(PBKDF2_SALT_BYTES)
+    iters = PBKDF2_ITERATIONS
+    hsh = pbkdf2_hash(secret, salt, iters)
+
+    scopes_list = [s.strip() for s in (scopes or "").split(",") if s.strip()]
+    if not scopes_list:
+        scopes_list = ["upload", "fetch"]
+
+    exp = None
+    if not never_expires:
+        if expires_in_days <= 0:
+            expires_in_days = 30
+        exp = int((now_utc() + timedelta(days=expires_in_days)).timestamp())
+
     doc = {
-        "key_hash": key_hash,
+        "key_id": key_id,
         "name": (name or "key")[:64],
+        "salt_b64": b64url(salt),
+        "hash_b64": hsh,
+        "iters": iters,
+        "scopes": scopes_list,
+        "rate_per_minute": int(rate_per_minute or 0),
         "revoked": False,
         "created_at": ts_utc(),
+        "expires_at": exp,
+        "last_used_at": None,
+        "last_used_ip": None,
     }
     try:
         await db.api_keys.insert_one(doc)
     except Exception:
         raise HTTPException(status_code=500, detail="Could not create key")
-    return JSONResponse({"api_key": raw})
+
+    return JSONResponse({
+        "api_key": raw,
+        "key_id": key_id,
+        "name": doc["name"],
+        "scopes": doc["scopes"],
+        "rate_per_minute": doc["rate_per_minute"],
+        "expires_at": doc["expires_at"],
+    })
+
+@app.get("/admin/keys/list")
+async def admin_list_keys(req: Request, limit: int = 100, _=Depends(require_admin)):
+    limit = max(1, min(int(limit or 100), 500))
+    cursor = db.api_keys.find({}, {"_id": 0, "salt_b64": 0, "hash_b64": 0}).sort("created_at", DESCENDING).limit(limit)
+    items = await cursor.to_list(length=limit)
+    return JSONResponse({"keys": items})
 
 @app.post("/admin/keys/revoke")
-async def admin_revoke_key(req: Request, api_key: str = Form(...), _=Depends(require_admin)):
-    key_hash = sha256_hex(api_key.strip())
-    r = await db.api_keys.update_one({"key_hash": key_hash}, {"$set": {"revoked": True, "revoked_at": ts_utc()}})
+async def admin_revoke_key(req: Request, key_id: str = Form(...), _=Depends(require_admin)):
+    key_id = (key_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9]{12}", key_id):
+        raise HTTPException(status_code=400, detail="Invalid key_id")
+    r = await db.api_keys.update_one({"key_id": key_id}, {"$set": {"revoked": True, "revoked_at": ts_utc()}})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Key not found")
-    return JSONResponse({"revoked": True})
+    return JSONResponse({"revoked": True, "key_id": key_id})
 
+@app.post("/admin/keys/revoke-raw")
+async def admin_revoke_raw(req: Request, api_key: str = Form(...), _=Depends(require_admin)):
+    raw = (api_key or "").strip()
+    key_id, _secret = parse_key(raw)
+    r = await db.api_keys.update_one({"key_id": key_id}, {"$set": {"revoked": True, "revoked_at": ts_utc()}})
+    if r.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Key not found")
+    return JSONResponse({"revoked": True, "key_id": key_id})
 
 @app.get("/debug/headers")
 async def debug_headers(req: Request):
@@ -444,5 +571,3 @@ async def debug_headers(req: Request):
         "origin": req.headers.get("origin"),
         "host": req.headers.get("host"),
     })
-
-    
