@@ -434,3 +434,15 @@ async def admin_revoke_key(req: Request, api_key: str = Form(...), _=Depends(req
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Key not found")
     return JSONResponse({"revoked": True})
+
+
+@app.get("/debug/headers")
+async def debug_headers(req: Request):
+    return JSONResponse({
+        "auth": req.headers.get("authorization"),
+        "admin": req.headers.get("x-admin-secret"),
+        "origin": req.headers.get("origin"),
+        "host": req.headers.get("host"),
+    })
+
+    
