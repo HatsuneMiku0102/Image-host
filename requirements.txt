@@ -4,3 +4,5 @@ httpx
 aiofiles
 pillow
 python-multipart
+pymongo
+motor
