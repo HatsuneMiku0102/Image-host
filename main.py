@@ -499,19 +499,24 @@ async def image(img_file: str, req: Request):
 
 @app.post("/admin/keys/create")
 async def admin_create_key(req: Request, name: str = Form("sharex"), _=Depends(require_admin)):
-    raw = "mk_" + secrets.token_urlsafe(32)
-    key_hash = sha256_hex(raw)
-    doc = {
-        "key_hash": key_hash,
-        "name": (name or "key")[:64],
-        "revoked": False,
-        "created_at": ts_utc(),
-    }
     try:
+        if db is None:
+            raise RuntimeError("db is None (Mongo not initialized)")
+        raw = "mk_" + secrets.token_urlsafe(32)
+        key_hash = sha256_hex(raw)
+        doc = {
+            "key_hash": key_hash,
+            "name": (name or "key")[:64],
+            "revoked": False,
+            "created_at": ts_utc(),
+        }
         await db.api_keys.insert_one(doc)
+        return JSONResponse({"api_key": raw})
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not create key: {type(e).__name__}: {str(e)}")
-    return JSONResponse({"api_key": raw})
+        return JSONResponse(
+            {"error": type(e).__name__, "message": str(e)},
+            status_code=500,
+        )
 
 
 @app.get("/admin/keys/list")
