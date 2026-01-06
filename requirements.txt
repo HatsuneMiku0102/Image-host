@@ -1,8 +1,7 @@
 fastapi
 uvicorn[standard]
-httpx
-aiofiles
-pillow
-python-multipart
-pymongo
 motor
+pymongo
+pillow
+httpx
+python-multipart
