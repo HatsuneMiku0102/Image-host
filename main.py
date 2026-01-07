@@ -227,17 +227,12 @@ cleanup_task: Optional[asyncio.Task] = None
 async def ensure_indexes():
     await db.images.create_index([("expires_at", ASCENDING)])
     await db.images.create_index([("created_at", ASCENDING)])
-
-    await db.api_keys.create_index(
-        [("key_id", ASCENDING)],
-        unique=True,
-        partialFilterExpression={"key_id": {"$type": "string"}},
-        name="key_id_unique_string",
-    )
+    await db.api_keys.create_index([("key_hash", ASCENDING)], unique=True)
+    await db.api_keys.create_index([("key_id", ASCENDING)], unique=True)
+    await db.api_keys.create_index([("user_id", ASCENDING)])
     await db.api_keys.create_index([("revoked", ASCENDING)])
-    await db.api_keys.create_index([("created_at", DESCENDING)])
-    await db.api_keys.create_index([("last_used_at", DESCENDING)])
-    await db.api_keys.create_index([("expires_at", ASCENDING)])
+    await db.api_keys.create_index([("created_at", ASCENDING)])
+
 
 
 async def cleanup_once():
@@ -501,25 +496,35 @@ async def image(img_file: str, req: Request):
     return StreamingResponse(gen(), media_type=row["mime"], headers=headers)
 
 @app.post("/admin/keys/create")
-async def admin_create_key(req: Request, name: str = Form("sharex"), _=Depends(require_admin)):
+async def admin_create_key(
+    req: Request,
+    name: str = Form("user"),
+    user_id: str = Form(""),
+    scopes: str = Form("upload,fetch"),
+    rate_per_minute: int = Form(30),
+    never_expires: int = Form(1),
+    _=Depends(require_admin),
+):
+    raw = "mk_" + secrets.token_urlsafe(32)
+    key_hash = sha256_hex(raw)
+    key_id = uuid.uuid4().hex[:12]
+    doc = {
+        "key_id": key_id,
+        "key_hash": key_hash,
+        "user_id": (user_id or "").strip() or None,
+        "name": (name or "key")[:64],
+        "scopes": [s.strip() for s in (scopes or "").split(",") if s.strip()],
+        "rate_per_minute": int(rate_per_minute) if str(rate_per_minute).isdigit() else 30,
+        "never_expires": True if str(never_expires) in ("1", "true", "True") else False,
+        "revoked": False,
+        "created_at": ts_utc(),
+    }
     try:
-        if db is None:
-            raise RuntimeError("db is None (Mongo not initialized)")
-        raw = "mk_" + secrets.token_urlsafe(32)
-        key_hash = sha256_hex(raw)
-        doc = {
-            "key_hash": key_hash,
-            "name": (name or "key")[:64],
-            "revoked": False,
-            "created_at": ts_utc(),
-        }
         await db.api_keys.insert_one(doc)
-        return JSONResponse({"api_key": raw})
     except Exception as e:
-        return JSONResponse(
-            {"error": type(e).__name__, "message": str(e)},
-            status_code=500,
-        )
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
+    return JSONResponse({"api_key": raw, "key_id": key_id})
+
 
 
 @app.get("/admin/keys/list")
