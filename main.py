@@ -505,12 +505,18 @@ async def admin_create_key(
     never_expires: int = Form(1),
     _=Depends(require_admin),
 ):
-    raw = "mk_" + secrets.token_urlsafe(32)
-    key_hash = sha256_hex(raw)
-    key_id = uuid.uuid4().hex[:12]
+    raw, key_id, secret = generate_key()
+
+    iters = PBKDF2_ITERATIONS
+    salt = secrets.token_bytes(PBKDF2_SALT_BYTES)
+    stored_hash = pbkdf2_hash(secret, salt, iters)
+    salt_b64 = b64url(salt)
+
     doc = {
         "key_id": key_id,
-        "key_hash": key_hash,
+        "salt_b64": salt_b64,
+        "hash_b64": stored_hash,
+        "iters": iters,
         "user_id": (user_id or "").strip() or None,
         "name": (name or "key")[:64],
         "scopes": [s.strip() for s in (scopes or "").split(",") if s.strip()],
@@ -518,12 +524,16 @@ async def admin_create_key(
         "never_expires": True if str(never_expires) in ("1", "true", "True") else False,
         "revoked": False,
         "created_at": ts_utc(),
+        "expires_at": None,
     }
+
     try:
         await db.api_keys.insert_one(doc)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
+
     return JSONResponse({"api_key": raw, "key_id": key_id})
+
 
 
 
