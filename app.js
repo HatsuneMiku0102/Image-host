@@ -91,26 +91,41 @@ uploadFile.addEventListener("change", () => {
 });
 
 uploadForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const f = uploadFile.files && uploadFile.files[0];
-  if (!f) return;
+  e.preventDefault()
+  const f = uploadFile.files && uploadFile.files[0]
+  if (!f) return
 
-  setStatus("busy", "Uploading…");
-  errorBox.classList.add("hidden");
+  setStatus("busy", "Uploading…")
+  errorBox.classList.add("hidden")
 
-  const fd = new FormData();
-  fd.append("file", f);
+  const fd = new FormData()
+  fd.append("file", f)
 
   try {
-    const res = await fetch(`${API_URL}/upload`, { method: "POST", body: fd });
-    const text = await res.text();
-    if (!res.ok) throw new Error(text || `HTTP ${res.status}`);
-    const data = JSON.parse(text);
-    showResult(data);
+    const res = await fetch(`${API_URL}/upload`, {
+      method: "POST",
+      body: fd,
+      credentials: "include"
+    })
+
+    const text = await res.text()
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}\n${text}`)
+    }
+
+    let data
+    try {
+      data = JSON.parse(text)
+    } catch {
+      throw new Error(`Expected JSON but got:\n${text}`)
+    }
+
+    showResult(data)
   } catch (err) {
-    showError(err?.message || String(err));
+    showError(err?.message || String(err))
   }
-});
+})
+
 
 fetchForm.addEventListener("submit", async (e) => {
   e.preventDefault();
