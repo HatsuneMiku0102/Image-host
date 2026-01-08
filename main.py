@@ -547,6 +547,53 @@ async def admin_create_key(
 
     return JSONResponse({"api_key": raw, "key_id": key_id})
 
+@app.post("/admin/keys/rotate")
+async def admin_rotate_key(
+    req: Request,
+    name: str = Form("user"),
+    user_id: str = Form(...),
+    scopes: str = Form("upload,fetch"),
+    rate_per_minute: int = Form(30),
+    never_expires: int = Form(1),
+    _=Depends(require_admin),
+):
+    uid = (user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="Missing user_id")
+
+    await db.api_keys.update_many(
+        {"user_id": uid, "revoked": {"$ne": True}},
+        {"$set": {"revoked": True, "revoked_at": ts_utc()}},
+    )
+
+    raw, key_id, secret = generate_key()
+
+    salt = secrets.token_bytes(PBKDF2_SALT_BYTES)
+    iters = int(PBKDF2_ITERATIONS)
+    hash_b64 = pbkdf2_hash(secret, salt, iters)
+    salt_b64 = b64url(salt)
+
+    doc = {
+        "key_id": key_id,
+        "key_hash": sha256_hex(raw),
+        "user_id": uid,
+        "name": (name or "key")[:64],
+        "scopes": [s.strip() for s in (scopes or "").split(",") if s.strip()],
+        "rate_per_minute": int(rate_per_minute) if str(rate_per_minute).isdigit() else 30,
+        "never_expires": True if str(never_expires) in ("1", "true", "True") else False,
+        "revoked": False,
+        "created_at": ts_utc(),
+        "iters": iters,
+        "salt_b64": salt_b64,
+        "hash_b64": hash_b64,
+    }
+
+    try:
+        await db.api_keys.insert_one(doc)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
+
+    return JSONResponse({"api_key": raw, "key_id": key_id, "rotated": True})
 
 
 @app.get("/admin/keys/list")
