@@ -521,6 +521,7 @@ async def admin_create_key(
 
     doc = {
         "key_id": key_id,
+        "key_hash": sha256_hex(raw),
         "user_id": (user_id or "").strip() or None,
         "name": (name or "key")[:64],
         "scopes": [s.strip() for s in (scopes or "").split(",") if s.strip()],
@@ -532,6 +533,7 @@ async def admin_create_key(
         "salt_b64": salt_b64,
         "hash_b64": hash_b64,
     }
+
 
     try:
         await db.api_keys.insert_one(doc)
