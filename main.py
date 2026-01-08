@@ -227,11 +227,18 @@ cleanup_task: Optional[asyncio.Task] = None
 async def ensure_indexes():
     await db.images.create_index([("expires_at", ASCENDING)])
     await db.images.create_index([("created_at", ASCENDING)])
-    await db.api_keys.create_index([("key_hash", ASCENDING)], unique=True)
+
     await db.api_keys.create_index([("key_id", ASCENDING)], unique=True)
     await db.api_keys.create_index([("user_id", ASCENDING)])
     await db.api_keys.create_index([("revoked", ASCENDING)])
     await db.api_keys.create_index([("created_at", ASCENDING)])
+
+    await db.api_keys.create_index(
+        [("key_hash", ASCENDING)],
+        unique=True,
+        partialFilterExpression={"key_hash": {"$exists": True, "$type": "string"}},
+    )
+
 
 
 
