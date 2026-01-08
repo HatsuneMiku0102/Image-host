@@ -233,11 +233,16 @@ async def ensure_indexes():
     await db.api_keys.create_index([("revoked", ASCENDING)])
     await db.api_keys.create_index([("created_at", ASCENDING)])
 
-    await db.api_keys.create_index(
-        [("key_hash", ASCENDING)],
-        unique=True,
-        partialFilterExpression={"key_hash": {"$exists": True, "$type": "string"}},
-    )
+    try:
+        await db.api_keys.create_index(
+            [("key_hash", ASCENDING)],
+            name="key_hash_unique_if_present",
+            unique=True,
+            partialFilterExpression={"key_hash": {"$exists": True, "$type": "string"}},
+        )
+    except Exception:
+        pass
+
 
 
 
